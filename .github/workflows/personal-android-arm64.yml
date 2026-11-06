@@ -1,0 +1,616 @@
+name: personal-android-arm64
+
+# Fork-only personal build for frankgrr/FlClash.
+# Triggered by workflow_dispatch only. Does not publish releases, and does
+# not use upstream KEYSTORE / KEY_ALIAS / STORE_PASSWORD / KEY_PASSWORD.
+# Do not add Telegram, Homebrew, F-Droid, or GitHub Release steps.
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_env:
+        description: APP_ENV for dart setup.dart --env (stable matches official v0.9.3 packaging; pre/dev show an on-screen banner)
+        type: choice
+        options:
+          - stable
+          - pre
+          - dev
+        default: stable
+
+concurrency:
+  group: personal-android-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: "3.47.6"
+  GO_VERSION: "1.27.1"
+  RUST_VERSION: "1.99.0"
+  NDK_VERSION: r28c
+  JAVA_VERSION: "17"
+  APP_ENV: ${{ github.event.inputs.app_env || 'stable' }}
+
+jobs:
+  static-analysis:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Checkout submodules over HTTPS
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Test git hooks
+        run: bash tool/hooks/test.sh
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install Dart/Flutter dependencies
+        run: flutter pub get
+
+      - name: Check format
+        run: dart format --output=none --set-exit-if-changed lib test tool plugins setup.dart
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos
+
+  unit-tests:
+    name: Dart unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Checkout submodules over HTTPS
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins/rust_api/rust
+          cache-directories: .dart_tool/hooks_runner
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install Dart/Flutter dependencies
+        run: flutter pub get
+
+      - name: Skip the Go core build hook
+        run: yq -i '.hooks.user_defines.setup.build_assets = false' pubspec.yaml
+
+      - name: Run tests
+        run: dart run tool/test.dart -- --reporter expanded
+
+      - name: Coverage threshold
+        if: false
+        run: echo "Coverage threshold is not run in this personal workflow."
+
+  go-core-tests:
+    name: Go core tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Checkout submodules over HTTPS
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - name: Validate Go core wrapper
+        working-directory: core
+        env:
+          CGO_ENABLED: 0
+        run: |
+          if ! compgen -G '*_test.go' > /dev/null; then
+            echo 'No Go tests found in core/; the test step would pass vacuously.' >&2
+            exit 1
+          fi
+          test -z "$(gofmt -l ./*.go ./cmd ./mobile ./platform ./timezone ./tun)" || {
+            gofmt -l ./*.go ./cmd ./mobile ./platform ./timezone ./tun >&2
+            exit 1
+          }
+          go test -count=1 .
+          go vet . ./cmd/...
+          GOOS=linux go vet ./platform
+
+      - name: Validate the Android core library
+        working-directory: core
+        env:
+          CGO_ENABLED: 0
+        run: |
+          tags="$(sed -n 's/^tags: *//p' ../build_config.yaml)"
+          test -n "$tags" || { echo 'Could not read tags from build_config.yaml' >&2; exit 1; }
+          GOOS=android GOARCH=arm64 go vet "-tags=$tags" . ./mobile ./tun ./platform
+
+  android-unit-tests:
+    name: Android unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Checkout submodules over HTTPS
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            core/go.sum
+            android/core/build.gradle.kts
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install Dart/Flutter dependencies
+        run: flutter pub get
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          link-to-sdk: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Run Android unit tests
+        working-directory: android
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          {
+            echo "flutter.sdk=$FLUTTER_ROOT"
+            echo "sdk.dir=$ANDROID_HOME"
+          } > local.properties
+          wrapper="$FLUTTER_ROOT/bin/cache/artifacts/gradle_wrapper"
+          test -d "$wrapper" || flutter precache
+          cp -R "$wrapper/." .
+          chmod +x gradlew
+          ./gradlew :common:testDebugUnitTest :service:testDebugUnitTest :app:testDebugUnitTest \
+            -Ptarget-platform=android-arm64 \
+            -x :app:compileFlutterBuildDebug -x :app:copyFlutterAssetsDebug
+
+  rust-tests:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            services/helper
+            plugins/rust_api/rust
+
+      - name: Check format
+        run: |
+          cargo fmt --manifest-path services/helper/Cargo.toml -- --check
+          cargo fmt --manifest-path plugins/rust_api/rust/Cargo.toml -- --check
+
+      - name: Run tests
+        run: |
+          cargo test --manifest-path services/helper/Cargo.toml
+          cargo test --manifest-path plugins/rust_api/rust/Cargo.toml
+
+  permission-and-deps:
+    name: Permission and dependency checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Checkout submodules over HTTPS
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Record Android permissions and package id
+        run: |
+          set -euo pipefail
+          info="$RUNNER_TEMP/permission-check.txt"
+          {
+            echo "package_id_declared=com.follow.clash"
+            echo "version_from_pubspec=$(sed -n 's/^version: //p' pubspec.yaml)"
+            echo
+            echo "=== uses-permission / uses-feature ==="
+            grep -RInE 'uses-permission|uses-feature' android --include='AndroidManifest.xml' || true
+            echo
+            echo "=== applicationId / namespace ==="
+            grep -nE 'applicationId|namespace' android/app/build.gradle.kts
+            echo
+            echo "=== expected per-app proxy permissions ==="
+          } > "$info"
+
+          if ! grep -q 'android.permission.QUERY_ALL_PACKAGES' android/app/src/main/AndroidManifest.xml; then
+            echo "MISSING android.permission.QUERY_ALL_PACKAGES" | tee -a "$info"
+            exit 1
+          fi
+          if ! grep -q 'com.android.permission.GET_INSTALLED_APPS' android/app/src/main/AndroidManifest.xml; then
+            echo "MISSING com.android.permission.GET_INSTALLED_APPS" | tee -a "$info"
+            exit 1
+          fi
+          if ! grep -q 'applicationId = "com.follow.clash"' android/app/build.gradle.kts; then
+            echo "applicationId is not com.follow.clash (refusing identity spoofing)" | tee -a "$info"
+            exit 1
+          fi
+          cat "$info"
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            {
+              echo "## Permission and package checks"
+              echo
+              echo '```'
+              cat "$info"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Validate local Flutter packages
+        run: bash tool/check_plugins.sh
+
+      - name: Validate setup hooks package
+        working-directory: plugins/setup/setup_hooks
+        run: |
+          dart pub get
+          dart analyze
+          dart test
+
+      - name: Record dependency pins
+        run: |
+          {
+            echo "## Toolchain and dependency pins"
+            echo
+            echo "- Flutter ${{ env.FLUTTER_VERSION }}"
+            echo "- Go ${{ env.GO_VERSION }} (core/go.mod: $(sed -n 's/^go //p' core/go.mod | head -n1))"
+            echo "- Rust ${{ env.RUST_VERSION }} (plugins/rust_api/rust/rust-toolchain.toml)"
+            echo "- JDK ${{ env.JAVA_VERSION }}"
+            echo "- Android NDK ${{ env.NDK_VERSION }} (see libs.versions.toml ndkVersion below)"
+            echo "- compileSdk/targetSdk from android/gradle/libs.versions.toml:"
+            grep -E '^(minSdk|targetSdk|compileSdk|ndkVersion)' android/gradle/libs.versions.toml | sed 's/^/  - /'
+            echo "- Clash.Meta core_version $(sed -n 's/^core_version: //p' build_config.yaml)"
+            echo "- Dart SDK constraint $(sed -n 's/^  sdk: //p' pubspec.yaml | head -n1)"
+          } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+  build-android-arm64:
+    name: Build Android arm64-v8a APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Checkout submodules over HTTPS
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            plugins/rust_api/rust
+          cache-directories: .dart_tool/hooks_runner
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: build-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Setup personal test signing
+        env:
+          PERSONAL_KEYSTORE: ${{ secrets.PERSONAL_KEYSTORE }}
+          PERSONAL_KEY_ALIAS: ${{ secrets.PERSONAL_KEY_ALIAS }}
+          PERSONAL_STORE_PASSWORD: ${{ secrets.PERSONAL_STORE_PASSWORD }}
+          PERSONAL_KEY_PASSWORD: ${{ secrets.PERSONAL_KEY_PASSWORD }}
+        run: |
+          set +x
+          set -euo pipefail
+          keystore_path="android/app/keystore.jks"
+          mkdir -p android/app
+          signing_source_file="$RUNNER_TEMP/signing-source.txt"
+
+          if [[ -n "${PERSONAL_KEYSTORE}" ]]; then
+            if [[ -z "${PERSONAL_KEY_ALIAS}" || -z "${PERSONAL_STORE_PASSWORD}" || -z "${PERSONAL_KEY_PASSWORD}" ]]; then
+              echo "PERSONAL_KEYSTORE is set, but PERSONAL_KEY_ALIAS / PERSONAL_STORE_PASSWORD / PERSONAL_KEY_PASSWORD must all be set." >&2
+              exit 1
+            fi
+            printf '%s' "$PERSONAL_KEYSTORE" | base64 --decode > "$keystore_path"
+            key_alias="$PERSONAL_KEY_ALIAS"
+            store_password="$PERSONAL_STORE_PASSWORD"
+            key_password="$PERSONAL_KEY_PASSWORD"
+            echo "fork-secret-PERSONAL_KEYSTORE" > "$signing_source_file"
+          else
+            if [[ -n "${PERSONAL_KEY_ALIAS}${PERSONAL_STORE_PASSWORD}${PERSONAL_KEY_PASSWORD}" ]]; then
+              echo "Signing alias/passwords were provided without PERSONAL_KEYSTORE." >&2
+              exit 1
+            fi
+            key_alias="flclash-personal"
+            store_password="$(openssl rand -base64 24)"
+            key_password="$store_password"
+            keytool -genkeypair \
+              -keystore "$keystore_path" \
+              -storetype PKCS12 \
+              -alias "$key_alias" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 3650 \
+              -storepass "$store_password" \
+              -keypass "$key_password" \
+              -dname "CN=FlClash Personal Test, OU=Personal, O=frankgrr, C=CN"
+            echo "ephemeral-generated-per-run" > "$signing_source_file"
+            echo "Generated an ephemeral test keystore for this run. Installs will not update-replace a previous ephemeral APK. Set PERSONAL_* fork secrets for a stable test signature."
+          fi
+
+          test -s "$keystore_path"
+          {
+            printf 'keyAlias=%s\n' "$key_alias"
+            printf 'storePassword=%s\n' "$store_password"
+            printf 'keyPassword=%s\n' "$key_password"
+          } >> android/local.properties
+
+          unset PERSONAL_KEYSTORE PERSONAL_KEY_ALIAS PERSONAL_STORE_PASSWORD PERSONAL_KEY_PASSWORD
+          unset key_alias store_password key_password
+
+      - name: Get Flutter Dependency
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Fetch CA certificates
+        env:
+          CA_BUNDLE: cacert-2026-09-25.pem
+          CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
+        run: |
+          bundle=core/Clash.Meta/component/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+
+      - name: Build arm64 APK
+        env:
+          ANDROID_NDK_HOME: ${{ steps.build-ndk.outputs.ndk-path }}
+        run: dart setup.dart android --arch arm64 --env "${APP_ENV}" -v
+
+      - name: Collect APK checksums and signing info
+        run: |
+          set -euo pipefail
+          shopt -s nullglob globstar
+          mapfile -t apks < <(find dist -type f -name '*.apk' | sort)
+          if [[ ${#apks[@]} -eq 0 ]]; then
+            echo "No APK found under dist/ after dart setup.dart android --arch arm64" >&2
+            ls -laR dist || true
+            exit 1
+          fi
+
+          mkdir -p dist
+          : > dist/SHA256SUMS
+          info=dist/BUILD-INFO.txt
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "ref=${GITHUB_REF}"
+            echo "commit=${GITHUB_SHA}"
+            echo "head_commit=$(git rev-parse HEAD)"
+            echo "describe=$(git describe --tags --always --dirty)"
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "app_env=${APP_ENV}"
+            echo "pubspec_version=$(sed -n 's/^version: //p' pubspec.yaml)"
+            echo "package_id=com.follow.clash"
+            echo "abi=arm64-v8a"
+            echo "flutter=${FLUTTER_VERSION}"
+            echo "go=${GO_VERSION}"
+            echo "rust=${RUST_VERSION}"
+            echo "ndk=${NDK_VERSION}"
+            echo "jdk=${JAVA_VERSION}"
+            echo "signing_source=$(cat "$RUNNER_TEMP/signing-source.txt")"
+            echo "signing_note=Certificate fingerprints only; private keys are never printed or uploaded."
+          } > "$info"
+
+          apksigner=""
+          if [[ -d "${ANDROID_HOME:-}" ]]; then
+            apksigner="$(ls -1 "${ANDROID_HOME}"/build-tools/*/apksigner 2>/dev/null | tail -n1 || true)"
+          fi
+          aapt=""
+          if [[ -d "${ANDROID_HOME:-}" ]]; then
+            aapt="$(ls -1 "${ANDROID_HOME}"/build-tools/*/aapt 2>/dev/null | tail -n1 || true)"
+          fi
+
+          for apk in "${apks[@]}"; do
+            rel="${apk#./}"
+            sha256sum "$rel" >> dist/SHA256SUMS
+            {
+              echo
+              echo "=== $(basename "$apk") ==="
+              echo "path=$rel"
+              echo "sha256=$(sha256sum "$apk" | awk '{print $1}')"
+              echo "size=$(wc -c < "$apk") bytes"
+            } >> "$info"
+            if [[ -n "$aapt" ]]; then
+              "$aapt" dump badging "$apk" | awk '
+                /^package: / { print }
+                /^native-code:/ { print }
+                /^application-label:/ { print }
+              ' >> "$info" || true
+            fi
+            if [[ -n "$apksigner" ]]; then
+              echo "--- apksigner verify --print-certs ---" >> "$info"
+              "$apksigner" verify --print-certs "$apk" >> "$info"
+            else
+              echo "--- keytool -printcert -jarfile (apksigner not found) ---" >> "$info"
+              keytool -printcert -jarfile "$apk" >> "$info"
+            fi
+          done
+
+          rm -f android/app/keystore.jks
+          if [[ -f android/local.properties ]]; then
+            sed -i '/^keyAlias=/d;/^storePassword=/d;/^keyPassword=/d' android/local.properties
+          fi
+
+          echo "===== BUILD-INFO ====="
+          cat "$info"
+          echo "===== SHA256SUMS ====="
+          cat dist/SHA256SUMS
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            {
+              echo "## Personal arm64-v8a build"
+              echo
+              echo '```'
+              cat "$info"
+              echo '```'
+              echo
+              echo "### SHA256SUMS"
+              echo
+              echo '```'
+              cat dist/SHA256SUMS
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload APK and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: flclash-personal-android-arm64-v8a
+          path: |
+            dist/**/*.apk
+            dist/SHA256SUMS
+            dist/BUILD-INFO.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  ci-summary:
+    name: Record check results
+    if: always()
+    needs:
+      - static-analysis
+      - unit-tests
+      - go-core-tests
+      - android-unit-tests
+      - rust-tests
+      - permission-and-deps
+      - build-android-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write checklist
+        run: |
+          {
+            echo "## Personal workflow checklist"
+            echo
+            echo "Results below use GitHub job conclusions. Checks that this workflow does not run are marked skipped, not passed."
+            echo
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Static analysis (format + flutter analyze + git hooks) | ${{ needs.static-analysis.result }} |"
+            echo "| Dart unit tests (tool/test.dart) | ${{ needs.unit-tests.result }} |"
+            echo "| Coverage threshold 75% | skipped |"
+            echo "| Go core tests / vet | ${{ needs.go-core-tests.result }} |"
+            echo "| Android unit tests | ${{ needs.android-unit-tests.result }} |"
+            echo "| Rust tests | ${{ needs.rust-tests.result }} |"
+            echo "| Permission and dependency checks | ${{ needs.permission-and-deps.result }} |"
+            echo "| Android arm64-v8a APK build + artifact | ${{ needs.build-android-arm64.result }} |"
+            echo "| Changelog verify | skipped |"
+            echo "| Desktop builds | skipped |"
+            echo "| Windows helper tests | skipped |"
+            echo "| GitHub Release / Telegram / Homebrew / F-Droid publish | skipped |"
+            echo "| Xiaomi 15 / HyperOS 4 install | skipped (待验证) |"
+            echo "| Xiaomi interception / vendor review | skipped (待验证) |"
+          } >> "$GITHUB_STEP_SUMMARY"
